@@ -61,17 +61,26 @@ class AutoTrader(BaseAutoTrader):
         if client_order_id != 0 and (client_order_id in self.bids or client_order_id in self.asks):
             self.on_order_status_message(client_order_id, 0, 0, 0)
 
+    """
+        Wrapper to send bid orders
+    """
     def send_bid_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
         bid_id = next(self.order_ids)
         self.send_insert_order(bid_id, Side.BUY, price, volume, type)
         self.bids[bid_id] = price
 
+    """
+        Wrapper to send ask orders
+    """
     def send_ask_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
         ask_id = next(self.order_ids)
         self.send_insert_order(ask_id, Side.SELL, price, volume, type)
         self.asks[ask_id] = price
 
-    # avoid being arbitraged
+    """
+        Cancel all orders that can be arbitraged
+        Example: If future trades at 100 and 120, cancel all bid > 120 and ask < 100
+    """
     def trim_orders(self) -> None:
         removed_bids = []
         for bid_id, bid in self.bids.items():
@@ -91,6 +100,10 @@ class AutoTrader(BaseAutoTrader):
         for ask_id in removed_asks:
             del self.asks[ask_id]
 
+    """
+       Cut down on the number of outstanding bid and ask orders
+    """
+
     def limit_book_size(self, bid_limit : int, ask_limit : int) -> None:
         while len(self.bids) > bid_limit:
             bid_id = min(self.bids, key=self.bids.get)
@@ -102,6 +115,11 @@ class AutoTrader(BaseAutoTrader):
             self.send_cancel_order(ask_id)
             del self.asks[ask_id]
 
+    """
+        arbitrage if bid is higher than ask between ETF/future
+        Arbitrage can helps to reduce position as well, but can also limit market making
+        Maybe show more preference towards arbitrage that reduce position rather than increase
+    """
     def handle_arbitrage(self, ask_prices : List[int], ask_volumes: List[int], 
             bid_prices: List[int], bid_volumes: List[int]) -> None:
 
@@ -121,6 +139,13 @@ class AutoTrader(BaseAutoTrader):
 
             if sell_volume > 0:
                 self.send_ask_order(sell_price, sell_volume, Lifespan.FILL_AND_KILL)
+
+    
+    """
+       Setup bid and ask order based on price of future
+       bid: [future_bid - 3, future_bid - 2,... future_bid - 1]
+       ask: [future_ask + 1, future_ask +2,...  future_ask + 3]
+    """
 
     def handle_market_making(self, ask_prices : List[int], ask_volumes: List[int],
             bid_prices: List[int], bid_volumes: List[int]) -> None:
