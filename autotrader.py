@@ -25,10 +25,10 @@ from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, M
 
 LOT_SIZE = 10
 POSITION_LIMIT = 100
+ARBITRAGE_LIMIT = 20
 TICK_SIZE_IN_CENTS = 100
 MIN_BID_NEAREST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
-
 
 class AutoTrader(BaseAutoTrader):
     """Example Auto-trader.
@@ -44,9 +44,9 @@ class AutoTrader(BaseAutoTrader):
         """Initialise a new instance of the AutoTrader class."""
         super().__init__(loop, team_name, secret)
         self.order_ids = itertools.count(1)
-        self.bids = set()
-        self.asks = set()
-        self.ask_id = self.ask_price = self.bid_id = self.bid_price = self.position = 0
+        self.bids = dict()
+        self.asks = dict()
+        self.ask_id = self.bid_id = self.position = self.future_bid = self.future_ask = 0
 
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
@@ -68,6 +68,89 @@ class AutoTrader(BaseAutoTrader):
         self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
                          price, volume)
 
+    def send_bid_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
+        self.bid_id = next(self.order_ids)
+        self.send_insert_order(self.bid_id, Side.BUY, price, volume, type)
+        self.bids[self.bid_id] = price
+
+    def send_ask_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
+        self.ask_id = next(self.order_ids)
+        self.send_insert_order(self.ask_id, Side.SELL, price, volume, type)
+        self.asks[self.ask_id] = price
+
+    # avoid being arbitraged
+    def trim_orders(self) -> None:
+
+        removed_bids = []
+        for bid_id, bid in self.bids.items():
+            if bid > self.future_ask:
+                self.send_cancel_order(bid_id)
+                removed_bids.append(bid_id)
+
+        removed_asks = []
+        for ask_id, ask in self.asks.items():
+            if ask < self.future_bid:
+                self.send_cancel_order(ask_id)
+                removed_asks.append(ask_id)
+
+        for bid_id in removed_bids:
+            del self.bids[bid_id]
+
+        for ask_id in removed_asks:
+            del self.asks[ask_id]
+
+    def limit_book_size(self, bid_limit : int, ask_limit : int) -> None:
+        while len(self.bids) > bid_limit:
+            bid_id = min(self.bids, key=self.bids.get)
+            self.send_cancel_order(bid_id)
+            del self.bids[bid_id]
+
+        while len(self.asks) > ask_limit:
+            ask_id = max(self.asks, key=self.asks.get)
+            self.send_cancel_order(ask_id)
+            del self.asks[ask_id]
+
+    def handle_arbitrage(self, ask_prices : List[int], ask_volumes: List[int], 
+            bid_prices: List[int], bid_volumes: List[int]) -> None:
+
+        if ask_prices[0] < self.future_bid:
+            # arbitrage, buy etf and sell future
+            buy_volume = min(ask_volumes[0], ARBITRAGE_LIMIT - self.position)
+            buy_price = ask_prices[0]
+
+            if buy_volume > 0:
+                self.send_bid_order(buy_price, buy_volume, Lifespan.FILL_AND_KILL)
+
+
+        elif bid_prices[0] > self.future_ask:
+            # arbitrage, buy future and sell etf
+            sell_volume = min(bid_volumes[0], self.position + ARBITRAGE_LIMIT)
+            sell_price = bid_prices[0]
+
+            if sell_volume > 0:
+                self.send_ask_order(sell_price, sell_volume, Lifespan.FILL_AND_KILL)
+
+    def handle_market_making(self, ask_prices : List[int], ask_volumes: List[int],
+            bid_prices: List[int], bid_volumes: List[int]) -> None:
+
+        max_buy_order = (POSITION_LIMIT - self.position) // LOT_SIZE
+        max_sell_order = (self.position + POSITION_LIMIT) // LOT_SIZE
+        left_bid = self.future_bid - 3 * TICK_SIZE_IN_CENTS
+        right_ask = self.future_ask + 3 * TICK_SIZE_IN_CENTS
+
+        for i in range(left_bid, left_bid + TICK_SIZE_IN_CENTS, TICK_SIZE_IN_CENTS):
+            if i not in self.bids.values() and max_buy_order > 0:
+                self.send_bid_order(i, LOT_SIZE)
+                max_buy_order -= 1 
+
+        for i in range(right_ask, right_ask + TICK_SIZE_IN_CENTS, TICK_SIZE_IN_CENTS):
+            if i not in self.asks.values() and max_sell_order > 0:
+                self.send_ask_order(i, LOT_SIZE)
+                max_sell_order -= 1
+
+
+        self.limit_book_size(3,3)
+
     def on_order_book_update_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                      ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
         """Called periodically to report the status of an order book.
@@ -77,31 +160,34 @@ class AutoTrader(BaseAutoTrader):
         prices are reported along with the volume available at each of those
         price levels.
         """
-        self.logger.info("received order book for instrument %d with sequence number %d", instrument,
-                         sequence_number)
+        # self.logger.info("received order book for instrument %d with sequence number %d", instrument,
+        #                  sequence_number)
+        
+        # error data
+        if bid_prices[0] == 0 or ask_prices[0] == 0:
+            return
+
+        if instrument == Instrument.ETF: 
+            print("ETF: ", bid_prices[0], ask_prices[0])
+
+            if ask_prices[0] < self.future_bid or bid_prices[0] > self.future_ask:
+                print(f"Arbitrage, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
+                self.handle_arbitrage(ask_prices, ask_volumes, bid_prices, bid_volumes)
+
+            elif ask_prices[0] > self.future_ask and bid_prices[0] < self.future_bid:
+                # set range for bid and ask and make the market
+                # also need to cancel unnecessary orders
+                # all orders 
+                print(f"Market making, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
+                self.handle_market_making(ask_prices, ask_volumes, bid_prices, bid_volumes)
+                pass
+
+
         if instrument == Instrument.FUTURE:
-            price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
-            new_bid_price = bid_prices[0] + price_adjustment if bid_prices[0] != 0 else 0
-            new_ask_price = ask_prices[0] + price_adjustment if ask_prices[0] != 0 else 0
-
-            if self.bid_id != 0 and new_bid_price not in (self.bid_price, 0):
-                self.send_cancel_order(self.bid_id)
-                self.bid_id = 0
-            if self.ask_id != 0 and new_ask_price not in (self.ask_price, 0):
-                self.send_cancel_order(self.ask_id)
-                self.ask_id = 0
-
-            if self.bid_id == 0 and new_bid_price != 0 and self.position < POSITION_LIMIT:
-                self.bid_id = next(self.order_ids)
-                self.bid_price = new_bid_price
-                self.send_insert_order(self.bid_id, Side.BUY, new_bid_price, LOT_SIZE, Lifespan.GOOD_FOR_DAY)
-                self.bids.add(self.bid_id)
-
-            if self.ask_id == 0 and new_ask_price != 0 and self.position > -POSITION_LIMIT:
-                self.ask_id = next(self.order_ids)
-                self.ask_price = new_ask_price
-                self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, LOT_SIZE, Lifespan.GOOD_FOR_DAY)
-                self.asks.add(self.ask_id)
+            print("Future: ", bid_prices[0], ask_prices[0])
+            self.future_bid = bid_prices[0]
+            self.future_ask = ask_prices[0]
+            self.trim_orders()
 
     def on_order_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when one of your orders is filled, partially or fully.
@@ -110,11 +196,14 @@ class AutoTrader(BaseAutoTrader):
         which may be better than the order's limit price. The volume is
         the number of lots filled at that price.
         """
+
         self.logger.info("received order filled for order %d with price %d and volume %d", client_order_id,
                          price, volume)
+
         if client_order_id in self.bids:
             self.position += volume
             self.send_hedge_order(next(self.order_ids), Side.ASK, MIN_BID_NEAREST_TICK, volume)
+
         elif client_order_id in self.asks:
             self.position -= volume
             self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, volume)
@@ -132,6 +221,7 @@ class AutoTrader(BaseAutoTrader):
         """
         self.logger.info("received order status for order %d with fill volume %d remaining %d and fees %d",
                          client_order_id, fill_volume, remaining_volume, fees)
+
         if remaining_volume == 0:
             if client_order_id == self.bid_id:
                 self.bid_id = 0
@@ -139,8 +229,8 @@ class AutoTrader(BaseAutoTrader):
                 self.ask_id = 0
 
             # It could be either a bid or an ask
-            self.bids.discard(client_order_id)
-            self.asks.discard(client_order_id)
+            self.bids.pop(client_order_id, None)
+            self.asks.pop(client_order_id, None)
 
     def on_trade_ticks_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
