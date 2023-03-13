@@ -46,7 +46,10 @@ class AutoTrader(BaseAutoTrader):
         self.order_ids = itertools.count(1)
         self.bids = dict()
         self.asks = dict()
-        self.ask_id = self.bid_id = self.position = self.future_bid = self.future_ask = 0
+        self.hedge_bid = set()
+        self.hedge_ask = set()
+
+        self.position = self.future_bid = self.future_ask = self.delta = 0
 
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
@@ -58,29 +61,18 @@ class AutoTrader(BaseAutoTrader):
         if client_order_id != 0 and (client_order_id in self.bids or client_order_id in self.asks):
             self.on_order_status_message(client_order_id, 0, 0, 0)
 
-    def on_hedge_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
-        """Called when one of your hedge orders is filled.
-
-        The price is the average price at which the order was (partially) filled,
-        which may be better than the order's limit price. The volume is
-        the number of lots filled at that price.
-        """
-        self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
-                         price, volume)
-
     def send_bid_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
-        self.bid_id = next(self.order_ids)
-        self.send_insert_order(self.bid_id, Side.BUY, price, volume, type)
-        self.bids[self.bid_id] = price
+        bid_id = next(self.order_ids)
+        self.send_insert_order(bid_id, Side.BUY, price, volume, type)
+        self.bids[bid_id] = price
 
     def send_ask_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
-        self.ask_id = next(self.order_ids)
-        self.send_insert_order(self.ask_id, Side.SELL, price, volume, type)
-        self.asks[self.ask_id] = price
+        ask_id = next(self.order_ids)
+        self.send_insert_order(ask_id, Side.SELL, price, volume, type)
+        self.asks[ask_id] = price
 
     # avoid being arbitraged
     def trim_orders(self) -> None:
-
         removed_bids = []
         for bid_id, bid in self.bids.items():
             if bid > self.future_ask:
@@ -133,8 +125,8 @@ class AutoTrader(BaseAutoTrader):
     def handle_market_making(self, ask_prices : List[int], ask_volumes: List[int],
             bid_prices: List[int], bid_volumes: List[int]) -> None:
 
-        max_buy_order = (POSITION_LIMIT - self.position) // LOT_SIZE
-        max_sell_order = (self.position + POSITION_LIMIT) // LOT_SIZE
+        max_buy_order = (POSITION_LIMIT - self.position) // LOT_SIZE - len(self.bids)
+        max_sell_order = (self.position + POSITION_LIMIT) // LOT_SIZE - len(self.asks)
         left_bid = self.future_bid - 3 * TICK_SIZE_IN_CENTS
         right_ask = self.future_ask + 3 * TICK_SIZE_IN_CENTS
 
@@ -167,9 +159,9 @@ class AutoTrader(BaseAutoTrader):
         if bid_prices[0] == 0 or ask_prices[0] == 0:
             return
 
-        if instrument == Instrument.ETF: 
-            print("ETF: ", bid_prices[0], ask_prices[0])
+        print(f"Position: {self.position}, delta: {self.delta}")
 
+        if instrument == Instrument.ETF: 
             if ask_prices[0] < self.future_bid or bid_prices[0] > self.future_ask:
                 print(f"Arbitrage, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
                 self.handle_arbitrage(ask_prices, ask_volumes, bid_prices, bid_volumes)
@@ -184,7 +176,6 @@ class AutoTrader(BaseAutoTrader):
 
 
         if instrument == Instrument.FUTURE:
-            print("Future: ", bid_prices[0], ask_prices[0])
             self.future_bid = bid_prices[0]
             self.future_ask = ask_prices[0]
             self.trim_orders()
@@ -202,11 +193,47 @@ class AutoTrader(BaseAutoTrader):
 
         if client_order_id in self.bids:
             self.position += volume
-            self.send_hedge_order(next(self.order_ids), Side.ASK, MIN_BID_NEAREST_TICK, volume)
+            self.delta += volume
+
+            ask_id = next(self.order_ids)
+            self.send_hedge_order(ask_id, Side.ASK, MIN_BID_NEAREST_TICK, volume)
+            self.hedge_ask.add(ask_id)
 
         elif client_order_id in self.asks:
             self.position -= volume
-            self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, volume)
+            self.delta -= volume
+
+            bid_id = next(self.order_ids)
+            self.send_hedge_order(bid_id, Side.BID, MAX_ASK_NEAREST_TICK, volume)
+            self.hedge_bid.add(bid_id)
+
+    def on_hedge_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
+        """Called when one of your hedge orders is filled.
+
+        The price is the average price at which the order was (partially) filled,
+        which may be better than the order's limit price. The volume is
+        the number of lots filled at that price.
+        """
+        self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
+                         price, volume)
+
+        if client_order_id in self.hedge_bid:
+            self.hedge_bid.remove(client_order_id)
+            self.delta += volume
+
+        elif client_order_id in self.hedge_ask:
+            self.hedge_ask.remove(client_order_id)
+            self.delta -= volume
+
+        if self.delta > 0:
+            ask_id = next(self.order_ids)
+            self.send_hedge_order(ask_id, Side.ASK, MIN_BID_NEAREST_TICK, self.delta)
+            self.hedge_ask.add(ask_id)
+
+        elif self.delta < 0:
+            bid_id = next(self.order_ids)
+            self.send_hedge_order(bid_id, Side.BID, MAX_ASK_NEAREST_TICK, -self.delta)
+            self.hedge_bid.add(bid_id)
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
@@ -223,11 +250,6 @@ class AutoTrader(BaseAutoTrader):
                          client_order_id, fill_volume, remaining_volume, fees)
 
         if remaining_volume == 0:
-            if client_order_id == self.bid_id:
-                self.bid_id = 0
-            elif client_order_id == self.ask_id:
-                self.ask_id = 0
-
             # It could be either a bid or an ask
             self.bids.pop(client_order_id, None)
             self.asks.pop(client_order_id, None)
