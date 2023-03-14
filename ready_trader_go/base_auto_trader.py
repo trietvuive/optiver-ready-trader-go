@@ -30,7 +30,6 @@ from .messages import (AMEND_MESSAGE, AMEND_MESSAGE_SIZE, CANCEL_MESSAGE, CANCEL
                        Connection, MessageType, Subscription)
 from .types import Lifespan, Side
 
-
 class BaseAutoTrader(Connection, Subscription):
     """Base class for an auto-trader."""
 

@@ -48,6 +48,7 @@ class AutoTrader(BaseAutoTrader):
         self.asks = dict()
         self.hedge_bid = set()
         self.hedge_ask = set()
+        self.msg_seq = 0
 
         self.position = self.future_bid = self.future_ask = self.delta = 0
 
@@ -72,10 +73,23 @@ class AutoTrader(BaseAutoTrader):
     """
         Wrapper to send ask orders
     """
+
     def send_ask_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
         ask_id = next(self.order_ids)
         self.send_insert_order(ask_id, Side.SELL, price, volume, type)
         self.asks[ask_id] = price
+
+    """
+        Wrapper to send hedge orders
+    """
+    def send_hedge(self, price: int, volume: int, side: Side) -> None:
+        order_id = next(self.order_ids)
+        if side == Side.BID:
+            self.hedge_bid.add(order_id)
+        else:
+            self.hedge_ask.add(order_id)
+
+        self.send_hedge_order(order_id, side, price, volume)
 
     """
         Cancel all orders that can be arbitraged
@@ -177,9 +191,12 @@ class AutoTrader(BaseAutoTrader):
         prices are reported along with the volume available at each of those
         price levels.
         """
-        # self.logger.info("received order book for instrument %d with sequence number %d", instrument,
-        #                  sequence_number)
-        
+
+        # Discard old data
+        self.msg_seq = max(self.msg_seq, sequence_number)
+        if sequence_number != self.msg_seq:
+            return
+
         # error data
         if bid_prices[0] == 0 or ask_prices[0] == 0:
             return
@@ -219,18 +236,12 @@ class AutoTrader(BaseAutoTrader):
         if client_order_id in self.bids:
             self.position += volume
             self.delta += volume
-
-            ask_id = next(self.order_ids)
-            self.send_hedge_order(ask_id, Side.ASK, MIN_BID_NEAREST_TICK, volume)
-            self.hedge_ask.add(ask_id)
+            self.send_hedge(MIN_BID_NEAREST_TICK, volume, Side.ASK)
 
         elif client_order_id in self.asks:
             self.position -= volume
             self.delta -= volume
-
-            bid_id = next(self.order_ids)
-            self.send_hedge_order(bid_id, Side.BID, MAX_ASK_NEAREST_TICK, volume)
-            self.hedge_bid.add(bid_id)
+            self.send_hedge(MAX_ASK_NEAREST_TICK, volume, Side.BID)
 
     def on_hedge_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when one of your hedge orders is filled.
@@ -251,14 +262,10 @@ class AutoTrader(BaseAutoTrader):
             self.delta -= volume
 
         if self.delta > 0:
-            ask_id = next(self.order_ids)
-            self.send_hedge_order(ask_id, Side.ASK, MIN_BID_NEAREST_TICK, self.delta)
-            self.hedge_ask.add(ask_id)
+            self.send_hedge(MIN_BID_NEAREST_TICK, self.delta, Side.ASK)
 
         elif self.delta < 0:
-            bid_id = next(self.order_ids)
-            self.send_hedge_order(bid_id, Side.BID, MAX_ASK_NEAREST_TICK, -self.delta)
-            self.hedge_bid.add(bid_id)
+            self.send_hedge(MAX_ASK_NEAREST_TICK, -self.delta, Side.BID)
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
