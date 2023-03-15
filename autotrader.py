@@ -27,7 +27,7 @@ from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, M
 
 LOT_SIZE = 10
 POSITION_LIMIT = 100
-ARBITRAGE_LIMIT = 20
+ARBITRAGE_LIMIT = 50
 TICK_SIZE_IN_CENTS = 100
 MIN_BID_NEAREST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
@@ -67,7 +67,7 @@ class AutoTrader(BaseAutoTrader):
 
     """ 
         Check if current message doesn't breach 50 messages limit
-        Quite scuff but whatever
+        Return true if can send, false if can't due to limit
     """
     def check_message_limit(self) -> bool:
         current_time = time.time()
@@ -78,6 +78,7 @@ class AutoTrader(BaseAutoTrader):
             print("Message limit reached! Drop order")
             return False
 
+        print("Process order")
         self.order_timestamps.append(current_time)
         return True
 
@@ -108,10 +109,12 @@ class AutoTrader(BaseAutoTrader):
 
     """
         Wrapper to send hedge orders
+        Hedge cannot be ignored, must be sent
+        This might be thread-unsafe, but hey, everything here is thread-unsafe anyway amirite :D
     """
     def send_hedge_order(self, price: int, volume: int, side: Side) -> bool:
-        if not self.check_message_limit():
-            return False
+        while not self.check_message_limit():
+            time.sleep(0.1)
 
         order_id = next(self.order_ids)
         if side == Side.BID:
@@ -243,12 +246,6 @@ class AutoTrader(BaseAutoTrader):
         if bid_prices[0] == 0 or ask_prices[0] == 0:
             return
 
-        if self.delta > 0:
-            self.send_hedge_order(MIN_BID_NEAREST_TICK, self.delta, Side.ASK)
-
-        elif self.delta < 0:
-            self.send_hedge_order(MAX_ASK_NEAREST_TICK, -self.delta, Side.BID)
-
         print(f"Position: {self.position}, delta: {self.delta}, current speed {len(self.order_timestamps)}")
 
         if instrument == Instrument.ETF: 
@@ -308,6 +305,11 @@ class AutoTrader(BaseAutoTrader):
         elif client_order_id in self.hedge_ask:
             self.hedge_ask.remove(client_order_id)
             self.delta -= volume
+
+        if self.delta > 0:
+            self.send_hedge_order(MIN_BID_NEAREST_TICK, self.delta, Side.ASK)
+        elif self.delta < 0:
+            self.send_hedge_order(MAX_ASK_NEAREST_TICK, -self.delta, Side.BID)
 
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
