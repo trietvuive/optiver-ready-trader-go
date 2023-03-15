@@ -17,8 +17,10 @@
 #     <https://www.gnu.org/licenses/>.
 import asyncio
 import itertools
+import time
 
 from typing import List
+from collections import deque
 
 from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, MINIMUM_BID, Side
 
@@ -49,6 +51,7 @@ class AutoTrader(BaseAutoTrader):
         self.hedge_bid = set()
         self.hedge_ask = set()
         self.msg_seq = 0
+        self.order_timestamps = deque()
 
         self.position = self.future_bid = self.future_ask = self.delta = 0
 
@@ -62,34 +65,73 @@ class AutoTrader(BaseAutoTrader):
         if client_order_id != 0 and (client_order_id in self.bids or client_order_id in self.asks):
             self.on_order_status_message(client_order_id, 0, 0, 0)
 
+    """ 
+        Check if current message doesn't breach 50 messages limit
+        Quite scuff but whatever
+    """
+    def check_message_limit(self) -> bool:
+        current_time = time.time()
+        while len(self.order_timestamps) > 0 and self.order_timestamps[0] < current_time - 1.01:
+            self.order_timestamps.popleft()
+
+        if len(self.order_timestamps) == 50:
+            print("Message limit reached! Drop order")
+            return False
+
+        self.order_timestamps.append(current_time)
+        return True
+
     """
         Wrapper to send bid orders
     """
-    def send_bid_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
+    def send_bid_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> bool:
+        if not self.check_message_limit():
+            return False
+
         bid_id = next(self.order_ids)
         self.send_insert_order(bid_id, Side.BUY, price, volume, type)
         self.bids[bid_id] = price
+        return True
 
     """
         Wrapper to send ask orders
     """
 
-    def send_ask_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> None:
+    def send_ask_order(self, price: int, volume: int, type = Lifespan.GOOD_FOR_DAY) -> bool:
+        if not self.check_message_limit():
+            return False
+
         ask_id = next(self.order_ids)
         self.send_insert_order(ask_id, Side.SELL, price, volume, type)
         self.asks[ask_id] = price
+        return True
 
     """
         Wrapper to send hedge orders
     """
-    def send_hedge(self, price: int, volume: int, side: Side) -> None:
+    def send_hedge_order(self, price: int, volume: int, side: Side) -> bool:
+        if not self.check_message_limit():
+            return False
+
         order_id = next(self.order_ids)
         if side == Side.BID:
             self.hedge_bid.add(order_id)
         else:
             self.hedge_ask.add(order_id)
 
-        self.send_hedge_order(order_id, side, price, volume)
+        super().send_hedge_order(order_id, side, price, volume)
+        return True
+
+    """
+        Wrapper to send cancel orders
+        Return False if throttled
+    """
+    def send_cancel_order(self, order_id: int) -> bool:
+        if not self.check_message_limit():
+            return False
+
+        super().send_cancel_order(order_id)
+        return True
 
     """
         Cancel all orders that can be arbitraged
@@ -99,14 +141,14 @@ class AutoTrader(BaseAutoTrader):
         removed_bids = []
         for bid_id, bid in self.bids.items():
             if bid > self.future_ask:
-                self.send_cancel_order(bid_id)
-                removed_bids.append(bid_id)
+                if self.send_cancel_order(bid_id):
+                    removed_bids.append(bid_id)
 
         removed_asks = []
         for ask_id, ask in self.asks.items():
             if ask < self.future_bid:
-                self.send_cancel_order(ask_id)
-                removed_asks.append(ask_id)
+                if self.send_cancel_order(ask_id):
+                    removed_asks.append(ask_id)
 
         for bid_id in removed_bids:
             del self.bids[bid_id]
@@ -201,7 +243,13 @@ class AutoTrader(BaseAutoTrader):
         if bid_prices[0] == 0 or ask_prices[0] == 0:
             return
 
-        print(f"Position: {self.position}, delta: {self.delta}")
+        if self.delta > 0:
+            self.send_hedge_order(MIN_BID_NEAREST_TICK, self.delta, Side.ASK)
+
+        elif self.delta < 0:
+            self.send_hedge_order(MAX_ASK_NEAREST_TICK, -self.delta, Side.BID)
+
+        print(f"Position: {self.position}, delta: {self.delta}, current speed {len(self.order_timestamps)}")
 
         if instrument == Instrument.ETF: 
             if ask_prices[0] < self.future_bid or bid_prices[0] > self.future_ask:
@@ -236,12 +284,12 @@ class AutoTrader(BaseAutoTrader):
         if client_order_id in self.bids:
             self.position += volume
             self.delta += volume
-            self.send_hedge(MIN_BID_NEAREST_TICK, volume, Side.ASK)
+            self.send_hedge_order(MIN_BID_NEAREST_TICK, volume, Side.ASK)
 
         elif client_order_id in self.asks:
             self.position -= volume
             self.delta -= volume
-            self.send_hedge(MAX_ASK_NEAREST_TICK, volume, Side.BID)
+            self.send_hedge_order(MAX_ASK_NEAREST_TICK, volume, Side.BID)
 
     def on_hedge_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when one of your hedge orders is filled.
@@ -261,11 +309,6 @@ class AutoTrader(BaseAutoTrader):
             self.hedge_ask.remove(client_order_id)
             self.delta -= volume
 
-        if self.delta > 0:
-            self.send_hedge(MIN_BID_NEAREST_TICK, self.delta, Side.ASK)
-
-        elif self.delta < 0:
-            self.send_hedge(MAX_ASK_NEAREST_TICK, -self.delta, Side.BID)
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
