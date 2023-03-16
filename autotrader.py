@@ -24,9 +24,16 @@ from collections import deque
 
 from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, MINIMUM_BID, Side
 
+# margin between etf bid/ask and making bid/ask
+MARGIN = 2
 
-LOT_SIZE = 10
+# volume per order
+LOT_SIZE = 20
+
+# max position limit
 POSITION_LIMIT = 100
+
+# arbitrage must not raise position above this
 ARBITRAGE_LIMIT = 20
 TICK_SIZE_IN_CENTS = 100
 MIN_BID_NEAREST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
@@ -164,13 +171,13 @@ class AutoTrader(BaseAutoTrader):
     def limit_book_size(self, bid_limit : int, ask_limit : int) -> None:
         while len(self.bids) > bid_limit:
             bid_id = min(self.bids, key=self.bids.get)
-            self.send_cancel_order(bid_id)
-            del self.bids[bid_id]
+            if self.send_cancel_order(bid_id):
+                del self.bids[bid_id]
 
         while len(self.asks) > ask_limit:
             ask_id = max(self.asks, key=self.asks.get)
-            self.send_cancel_order(ask_id)
-            del self.asks[ask_id]
+            if self.send_cancel_order(ask_id):
+                del self.asks[ask_id]
 
     """
         arbitrage if bid is higher than ask between ETF/future
@@ -204,24 +211,25 @@ class AutoTrader(BaseAutoTrader):
        ask: [future_ask + 1, future_ask +2,...  future_ask + 3]
     """
 
-    def handle_market_making(self, ask_prices : List[int], ask_volumes: List[int],
-            bid_prices: List[int], bid_volumes: List[int]) -> None:
+    def handle_market_making(self, etf_bid : int, etf_ask : int) -> None:
 
         max_buy_order = (POSITION_LIMIT - self.position) // LOT_SIZE - len(self.bids)
         max_sell_order = (self.position + POSITION_LIMIT) // LOT_SIZE - len(self.asks)
-        left_bid = self.future_bid - 3 * TICK_SIZE_IN_CENTS
-        right_ask = self.future_ask + 3 * TICK_SIZE_IN_CENTS
+        
+        max_bid = self.future_bid - 2 * TICK_SIZE_IN_CENTS
+        min_ask = self.future_ask + 2 * TICK_SIZE_IN_CENTS
 
-        for i in range(left_bid, left_bid + TICK_SIZE_IN_CENTS, TICK_SIZE_IN_CENTS):
-            if i not in self.bids.values() and max_buy_order > 0:
-                self.send_bid_order(i, LOT_SIZE)
-                max_buy_order -= 1 
-
-        for i in range(right_ask, right_ask + TICK_SIZE_IN_CENTS, TICK_SIZE_IN_CENTS):
+        for i in range(min_ask, etf_ask, TICK_SIZE_IN_CENTS):
             if i not in self.asks.values() and max_sell_order > 0:
+                print("Sending ask order at {}".format(i))
                 self.send_ask_order(i, LOT_SIZE)
                 max_sell_order -= 1
 
+        for i in range(etf_bid, max_bid, TICK_SIZE_IN_CENTS):
+            if i not in self.bids.values() and max_buy_order > 0:
+                print("Sending bid order at {}".format(i))
+                self.send_bid_order(i, LOT_SIZE)
+                max_buy_order -= 1 
 
         self.limit_book_size(3,3)
 
@@ -244,19 +252,17 @@ class AutoTrader(BaseAutoTrader):
         if bid_prices[0] == 0 or ask_prices[0] == 0:
             return
 
-        self.logger.info(f"Position: {self.position}, delta: {self.delta}, current speed {len(self.order_timestamps)}")
+        print(f"Position: {self.position}, delta: {self.delta}, current speed {len(self.order_timestamps)}")
 
         if instrument == Instrument.ETF: 
             if ask_prices[0] < self.future_bid or bid_prices[0] > self.future_ask:
-                self.logger.info(f"Arbitrage, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
                 self.handle_arbitrage(ask_prices, ask_volumes, bid_prices, bid_volumes)
 
             elif ask_prices[0] > self.future_ask and bid_prices[0] < self.future_bid:
                 # set range for bid and ask and make the market
                 # also need to cancel unnecessary orders
                 # all orders 
-                self.logger.info(f"Market making, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
-                self.handle_market_making(ask_prices, ask_volumes, bid_prices, bid_volumes)
+                self.handle_market_making(bid_prices[0], ask_prices[0])
                 pass
 
 
@@ -282,23 +288,6 @@ class AutoTrader(BaseAutoTrader):
             self.delta -= volume
             self.send_hedge_order(MAX_ASK_NEAREST_TICK, volume, Side.BID)
 
-    def on_hedge_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
-        """Called when one of your hedge orders is filled.
-
-        The price is the average price at which the order was (partially) filled,
-        which may be better than the order's limit price. The volume is
-        the number of lots filled at that price.
-        """
-        self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
-                         price, volume)
-
-        if client_order_id in self.hedge_bid:
-            self.hedge_bid.remove(client_order_id)
-            self.delta += volume
-
-        elif client_order_id in self.hedge_ask:
-            self.hedge_ask.remove(client_order_id)
-            self.delta -= volume
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
@@ -318,6 +307,25 @@ class AutoTrader(BaseAutoTrader):
             # It could be either a bid or an ask
             self.bids.pop(client_order_id, None)
             self.asks.pop(client_order_id, None)
+
+    def on_hedge_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
+        """Called when one of your hedge orders is filled.
+
+        The price is the average price at which the order was (partially) filled,
+        which may be better than the order's limit price. The volume is
+        the number of lots filled at that price.
+        """
+        self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
+                         price, volume)
+
+        if client_order_id in self.hedge_bid:
+            self.hedge_bid.remove(client_order_id)
+            self.delta += volume
+
+        elif client_order_id in self.hedge_ask:
+            self.hedge_ask.remove(client_order_id)
+            self.delta -= volume
+
 
     def on_trade_ticks_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
