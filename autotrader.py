@@ -75,10 +75,8 @@ class AutoTrader(BaseAutoTrader):
             self.order_timestamps.popleft()
 
         if len(self.order_timestamps) == 50:
-            print("Message limit reached! Drop order")
             return False
 
-        print("Process order")
         self.order_timestamps.append(current_time)
         return True
 
@@ -246,18 +244,18 @@ class AutoTrader(BaseAutoTrader):
         if bid_prices[0] == 0 or ask_prices[0] == 0:
             return
 
-        print(f"Position: {self.position}, delta: {self.delta}, current speed {len(self.order_timestamps)}")
+        self.logger.info(f"Position: {self.position}, delta: {self.delta}, current speed {len(self.order_timestamps)}")
 
         if instrument == Instrument.ETF: 
             if ask_prices[0] < self.future_bid or bid_prices[0] > self.future_ask:
-                print(f"Arbitrage, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
+                self.logger.info(f"Arbitrage, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
                 self.handle_arbitrage(ask_prices, ask_volumes, bid_prices, bid_volumes)
 
             elif ask_prices[0] > self.future_ask and bid_prices[0] < self.future_bid:
                 # set range for bid and ask and make the market
                 # also need to cancel unnecessary orders
                 # all orders 
-                print(f"Market making, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
+                self.logger.info(f"Market making, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
                 self.handle_market_making(ask_prices, ask_volumes, bid_prices, bid_volumes)
                 pass
 
@@ -274,10 +272,6 @@ class AutoTrader(BaseAutoTrader):
         which may be better than the order's limit price. The volume is
         the number of lots filled at that price.
         """
-
-        self.logger.info("received order filled for order %d with price %d and volume %d", client_order_id,
-                         price, volume)
-
         if client_order_id in self.bids:
             self.position += volume
             self.delta += volume
