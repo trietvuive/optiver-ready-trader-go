@@ -253,7 +253,7 @@ class AutoTrader(BaseAutoTrader):
                 print(f"Arbitrage, future at {self.future_bid} {self.future_ask}, etf at {bid_prices[0]} {ask_prices[0]}")
                 self.handle_arbitrage(ask_prices, ask_volumes, bid_prices, bid_volumes)
 
-            elif ask_prices[0] > self.future_ask and bid_prices[0] < self.future_bid:
+            else:
                 # set range for bid and ask and make the market
                 # also need to cancel unnecessary orders
                 # all orders 
