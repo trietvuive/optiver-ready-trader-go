@@ -160,3 +160,5 @@ cython_debug/
 #.idea/
 
 autotrader.json
+autotrader2.json
+autotrader2.py
